@@ -7,6 +7,7 @@ so we never trust it for identity.
 """
 
 import os
+import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -128,6 +129,69 @@ async def lookup(allele: Allele) -> list[dict[str, Any]]:
             if _vcf_match(va, allele):
                 records.append(_parse_record(va))
     return records
+
+
+_PROTEIN_RE = re.compile(r"\(p\.([A-Z][a-z]{2})(\d+)([A-Za-z]{3}|=|\*|[a-z][A-Za-z0-9*]*)?")
+
+
+def _protein_change(name: str) -> tuple[str, int, str] | None:
+    m = _PROTEIN_RE.search(name or "")
+    return (m[1], int(m[2]), m[3] or "") if m else None
+
+
+def codon_range(pos: int, cds_start: int, strand: int) -> tuple[int, int]:
+    """GRCh38 span of the codon containing a coding base (assumes the codon
+    does not straddle an exon junction)."""
+    phase = (cds_start - 1) % 3  # 0, 1, 2 = position of this base within its codon
+    if strand == 1:
+        return pos - phase, pos - phase + 2
+    return pos + phase - 2, pos + phase
+
+
+async def codon_variants(allele: Allele, transcript: dict[str, Any]) -> dict[str, Any]:
+    """ClinVar simple-allele records at the same codon, excluding this exact allele.
+
+    Evidence for ACMG PS1 (same amino-acid change, different nucleotide) and
+    PM5 (different missense change at the same residue). The queried variant's
+    own record is never returned, so this is safe to expose when ClinVar is hidden.
+    """
+    query = _protein_change(f"({transcript.get('hgvsp', '').split(':')[-1]})")
+    lo, hi = codon_range(allele.pos, int(transcript["cds_start"]), int(transcript.get("strand", 1)))
+    ids = await search_ids(f"{allele.chrom}[chr] AND {lo}:{hi}[chrpos38]", 200)
+    others = []
+    for va, rec in await fetch_by_variation_ids(ids) if ids else []:
+        other = vcf_allele_of(va)
+        if other is None or other == allele or va.find("ClassifiedRecord/SimpleAllele") is None:
+            continue
+        if not (lo <= other.pos <= hi):  # indels anchored outside the codon
+            continue
+        change = _protein_change(rec["name"])
+        if query and change and change[:2] == query[:2]:
+            alt = change[2]
+            relation = (
+                "same_amino_acid_change" if alt == query[2] else
+                "synonymous" if alt == "=" else
+                "nonsense" if alt in {"Ter", "*"} else
+                "other_protein_change" if not alt or alt[0].islower() else  # fs, del, dup, ins
+                "different_missense"
+            )
+        else:
+            relation = "same_codon_other"
+        others.append({
+            "name": rec["name"], "vcf_id": other.vcf_id, "relation": relation,
+            "germline_classification": rec["germline_classification"], "review_status": rec["review_status"],
+            "review_stars": rec["review_stars"], "accession": rec["accession"],
+        })
+    others.sort(key=lambda r: (-r["review_stars"], r["relation"]))
+    return {
+        "variant": allele.vcf_id,
+        "protein_change": transcript.get("hgvsp"),
+        "codon_grch38": f"{allele.chrom}:{lo}-{hi}",
+        "records": others,
+        "note": "same_amino_acid_change -> PS1 candidate; different_missense -> PM5 candidate "
+                "(only if that change is classified pathogenic with adequate review). This variant's own "
+                "ClinVar record is excluded.",
+    }
 
 
 async def fetch_by_variation_ids(ids: list[str]) -> list[tuple[ET.Element, dict[str, Any]]]:

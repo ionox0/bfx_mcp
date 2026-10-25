@@ -14,13 +14,17 @@ THREE_TIER = {
     "Likely benign": "B/LB", "Benign": "B/LB",
 }
 
+_CLASSIFY_METRICS = [
+    {"id": "three_tier", "label": "3-tier match", "kind": "binary"},
+    {"id": "exact", "label": "5-tier exact", "kind": "binary"},
+    {"id": "severe_error", "label": "P<->B flip", "kind": "binary", "better": "lower"},
+    {"id": "within_one", "label": "within 1 tier", "kind": "binary"},
+    {"id": "self_consistent", "label": "self-consistent", "kind": "binary"},
+]
+
 METRICS = {
-    "reasoning": [
-        {"id": "three_tier", "label": "3-tier match", "kind": "binary"},
-        {"id": "exact", "label": "5-tier exact", "kind": "binary"},
-        {"id": "severe_error", "label": "P<->B flip", "kind": "binary", "better": "lower"},
-        {"id": "within_one", "label": "within 1 tier", "kind": "binary"},
-    ],
+    "reasoning": _CLASSIFY_METRICS,
+    "interpret": _CLASSIFY_METRICS,
     "tool_use": [
         {"id": "correct", "label": "correct", "kind": "binary"},
     ],
@@ -38,16 +42,44 @@ def _norm(s: Any) -> str:
     return re.sub(r"[\s_\-]+", " ", str(s)).strip().lower()
 
 
+_POINTS = {"very strong": 8, "strong": 4, "moderate": 2, "supporting": 1}
+
+
+def tier_from_criteria(criteria: list[dict]) -> str | None:
+    """5-tier class implied by the stated criteria under the ACMG point system
+    (Tavtigian 2018/2020). None if the criteria can't be scored."""
+    total = 0
+    for c in criteria:
+        code = str(c.get("code", "")).strip().upper()
+        strength = str(c.get("strength", "")).strip().lower()
+        if code.startswith("BA1") or strength == "stand-alone":
+            if code.startswith("B"):
+                return "Benign"
+            continue
+        if code[:1] not in {"P", "B"} or strength not in _POINTS:
+            return None
+        total += _POINTS[strength] if code.startswith("P") else -_POINTS[strength]
+    if total >= 10:
+        return "Pathogenic"
+    if total >= 6:
+        return "Likely pathogenic"
+    if total >= 0:
+        return "Uncertain significance"
+    return "Likely benign" if total >= -6 else "Benign"
+
+
 def grade_reasoning(expected: dict, answer: dict) -> dict[str, float]:
     gold, got = expected["classification"], answer.get("classification")
     if got not in TIERS:
-        return {"three_tier": 0.0, "exact": 0.0, "severe_error": 0.0, "within_one": 0.0}
+        return {"three_tier": 0.0, "exact": 0.0, "severe_error": 0.0, "within_one": 0.0, "self_consistent": 0.0}
     g3, a3 = THREE_TIER[gold], THREE_TIER[got]
     return {
         "three_tier": float(g3 == a3),
         "exact": float(gold == got),
         "severe_error": float({g3, a3} == {"P/LP", "B/LB"}),
         "within_one": float(abs(TIERS.index(gold) - TIERS.index(got)) <= 1),
+        # Reference-free: does the submitted tier follow from the agent's own criteria?
+        "self_consistent": float(tier_from_criteria(answer.get("criteria") or []) == got),
     }
 
 
@@ -105,4 +137,5 @@ def grade_retrieval(expected: dict, answer: dict) -> dict[str, float]:
     return {"all_fields": float(all(scores.values())), **scores}
 
 
-GRADERS = {"reasoning": grade_reasoning, "tool_use": grade_tool_use, "retrieval": grade_retrieval}
+GRADERS = {"reasoning": grade_reasoning, "interpret": grade_reasoning, "tool_use": grade_tool_use,
+           "retrieval": grade_retrieval}

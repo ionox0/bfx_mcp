@@ -11,5 +11,8 @@ wheels/
 
 # Eval artifacts
 evals/data/cache.sqlite
+evals/data/build.log
 .claude/hillclimb/*/*/traces/
 .pytest_cache/
+.claude
+evals/data/

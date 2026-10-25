@@ -6,6 +6,7 @@ Tools (model-invoked)
   get_population_frequency    gnomAD v4/v3: AC/AN/AF, homozygotes, grpmax FAF95, per-ancestry AF
   get_gene_constraint         gnomAD: pLI, LOEUF, missense Z, MANE transcript
   get_clinvar_classification  ClinVar: aggregate classification, review status, submissions
+  get_clinvar_codon_variants  ClinVar: other alleles at the same codon (PS1/PM5), own record excluded
 
 Resources (app/user-attached)
   genomics://sources                 provenance, versions and limitations
@@ -15,8 +16,9 @@ Resources (app/user-attached)
 Prompts (user-picked)
   interpret_variant                  ACMG-style interpretation workflow
 
-Set GENOMICS_MCP_HIDE_CLINVAR=1 to withhold ClinVar (used by the blinded eval
-track, where ClinVar classifications are the gold labels).
+Set GENOMICS_MCP_HIDE_CLINVAR=1 to withhold the variant's own ClinVar record
+(used by the blinded eval tracks, where ClinVar classifications are the gold
+labels). GENOMICS_MCP_FEATURES selects server improvements (see features.py).
 """
 
 import asyncio
@@ -30,7 +32,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from . import clinvar, ensembl, gnomad
+from . import clinvar, ensembl, features, gnomad
 from .http import CACHE_TTL_S, UpstreamError, log
 from .variants import Allele, VariantInputError, classify_input, resolve, resolve_one
 
@@ -96,18 +98,19 @@ async def normalize_variant(variant: str) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def annotate_variant(variant: str) -> dict[str, Any]:
+async def annotate_variant(variant: str, gene: str | None = None) -> dict[str, Any]:
     """Predicted molecular consequence and in-silico scores from Ensembl VEP.
 
-    Returns the most severe consequence; for the MANE Select (else canonical)
-    transcript: HGVS c./p., exon/intron, impact, SIFT, PolyPhen, CADD, REVEL,
-    AlphaMissense, SpliceAI delta scores and LOFTEE loss-of-function calls;
-    plus consequences on other protein-coding transcripts. Contains no
-    clinical assertions. Ensembl can take 10-60 s.
+    Returns the most severe consequence; for the MANE Select transcript the
+    variant falls in (else canonical): HGVS c./p., exon/intron, impact, SIFT,
+    PolyPhen, CADD, REVEL, AlphaMissense, SpliceAI delta scores and LOFTEE
+    loss-of-function calls; plus consequences on other protein-coding
+    transcripts. Pass `gene` (HGNC symbol) to report on that gene's transcript
+    where genes overlap. Contains no clinical assertions. Ensembl can take 10-60 s.
     """
     allele = await _allele(variant)
     try:
-        return await ensembl.annotate(allele)
+        return await ensembl.annotate(allele, gene)
     except UpstreamError as e:
         raise _upstream("Ensembl VEP", e) from e
 
@@ -170,6 +173,30 @@ if not HIDE_CLINVAR:
     mcp.tool(annotations=READ_ONLY)(get_clinvar_classification)
 
 
+async def get_clinvar_codon_variants(variant: str, gene: str | None = None) -> dict[str, Any]:
+    """Other ClinVar variants at the same codon, for ACMG PS1 and PM5.
+
+    Returns ClinVar records (classification, review stars) for other alleles in
+    the codon this coding variant changes, each labelled same_amino_acid_change
+    (PS1 candidate), different_missense (PM5 candidate), nonsense, other_protein_change or synonymous.
+    The queried variant's own ClinVar record is always excluded, so this tool is
+    available even when get_clinvar_classification is not. Pass `gene` where
+    genes overlap.
+    """
+    allele = await _allele(variant)
+    try:
+        transcript = await ensembl.coding_position(allele, gene)
+        if transcript is None:
+            raise ToolError(f"{allele.vcf_id} is not in a coding sequence, so PS1/PM5 do not apply.")
+        return await clinvar.codon_variants(allele, transcript)
+    except UpstreamError as e:
+        raise _upstream("Ensembl VEP / ClinVar", e) from e
+
+
+if features.on("codon"):
+    mcp.tool(annotations=READ_ONLY)(get_clinvar_codon_variants)
+
+
 # --------------------------------------------------------------------------- resources
 
 SOURCES_MD = f"""\
@@ -200,7 +227,12 @@ def sources() -> str:
 @mcp.resource("genomics://acmg-criteria", mime_type="text/markdown")
 def acmg_criteria() -> str:
     """ACMG/AMP criteria summary, combining rules, and which tool supplies each criterion's evidence."""
-    return files("genomics_mcp").joinpath("acmg_criteria.md").read_text()
+    text = files("genomics_mcp").joinpath("acmg_criteria.md").read_text()
+    if features.on("codon"):
+        text = text.replace("ClinVar (other alleles at the codon)", "`get_clinvar_codon_variants`")
+    if features.on("pvs1"):
+        text = text.replace("`annotate_variant` (consequence, LOFTEE", "`annotate_variant` (`pvs1_context`: NMD prediction, last exon; consequence, LOFTEE")
+    return text
 
 
 @mcp.resource("genomics://variant/{variant}", mime_type="application/json")

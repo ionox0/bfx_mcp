@@ -47,15 +47,20 @@ NAME_RE = re.compile(r"^(NM_\d+\.\d+)\(([A-Za-z0-9-]+)\):(c\.[^\s]+)")
 SKIP_CONDITIONS = {"not provided", "not specified", "See cases"}
 
 
-async def vep(allele: Allele) -> dict | None:
-    """VEP with extra patience for Ensembl outages; None if it stays down."""
-    for round_ in range(3):
+async def vep_many(alleles: list[Allele]) -> dict[str, dict]:
+    """Batched VEP with extra patience for Ensembl outages. Missing keys = never annotated."""
+    out: dict[str, dict] = {}
+    for round_ in range(4):
+        todo = [a for a in dict.fromkeys(alleles) if a.vcf_id not in out]
+        if not todo:
+            break
         try:
-            return await ensembl.annotate(allele)
+            out |= await ensembl.annotate_many(todo)
         except UpstreamError as e:
-            log(f"VEP round {round_ + 1}/3 failed for {allele.vcf_id}: {str(e)[:80]}")
+            log(f"VEP batch round {round_ + 1}/4 failed ({len(todo)} variants): {str(e)[:80]}")
             await asyncio.sleep(30)
-    return None
+    log(f"VEP: annotated {len(out)}/{len(set(alleles))} variants")
+    return out
 
 
 def hgvs_of(name: str) -> tuple[str, str] | None:
@@ -81,8 +86,8 @@ def usable(va, rec: dict, allele: Allele | None) -> bool:
 # ----------------------------------------------------------------------------- reasoning
 
 
-async def build_reasoning(rng: random.Random) -> list[dict]:
-    cases: list[dict] = []
+async def build_reasoning(rng: random.Random, seed: int = SEED, exclude: frozenset[str] = frozenset()) -> list[dict]:
+    all_picked: list[tuple[str, dict]] = []
     for tier in TIERS:
         picked: list[dict] = []
         genes = REASONING_GENES[:]
@@ -94,7 +99,7 @@ async def build_reasoning(rng: random.Random) -> list[dict]:
                     break
                 status = '("reviewed by expert panel"[Review status] OR "practice guideline"[Review status])'
                 ids = await clinvar.search_ids(f"{gene}[gene] AND {status} AND {TIER_FILTER[tier]}[Properties]", 300)
-                rng_g = random.Random(f"{SEED}-{gene}-{tier}")
+                rng_g = random.Random(f"{seed}-{gene}-{tier}")
                 rng_g.shuffle(ids)
                 for va, rec in await clinvar.fetch_by_variation_ids(ids[:12]):
                     allele = clinvar.vcf_allele_of(va)
@@ -102,33 +107,51 @@ async def build_reasoning(rng: random.Random) -> list[dict]:
                         rec["germline_classification"] == tier
                         and rec["review_stars"] >= 3
                         and usable(va, rec, allele)
+                        and rec["variation_id"] not in exclude
                         and not any(c["variation_id"] == rec["variation_id"] for c in picked)
                         and sum(c["gene"] == gene for c in picked) <= round_
                     ):
                         hgvs, sym = hgvs_of(rec["name"])
+                        if sym != gene:  # named on an overlapping gene's transcript (e.g. RS1 inside CDKL5)
+                            continue
                         picked.append({
                             "variation_id": rec["variation_id"], "gene": sym, "hgvs": hgvs, "allele": allele,
                             "condition": condition_of(rec), "rec": rec,
                         })
                         break
         log(f"reasoning: {tier}: {len(picked)} cases")
-        for p in picked:
-            ann = await vep(p["allele"])
-            consequence = (
-                (ann.get("primary_transcript") or {}).get("consequence_terms", [ann["most_severe_consequence"]])
-                if ann else ["unannotated"]
-            )
-            cases.append({
-                "id": f"reasoning-{p['gene']}-{p['variation_id']}",
-                "track": "reasoning",
-                "tags": [tier, p["gene"], consequence[0]],
-                "input": {"variant": p["hgvs"], "gene": p["gene"], "condition": p["condition"]},
-                "expected": {"classification": tier},
-                "meta": {
-                    "clinvar_accession": p["rec"]["accession"], "review_status": p["rec"]["review_status"],
-                    "date_last_evaluated": p["rec"]["date_last_evaluated"], "vcf_id": p["allele"].vcf_id,
-                },
-            })
+        all_picked += [(tier, p) for p in picked]
+
+    # One batched VEP pass for every case; also pre-warms the cache the agent will hit.
+    anns = await vep_many([p["allele"] for _, p in all_picked])
+    cases: list[dict] = []
+    for tier, p in all_picked:
+        ann = anns.get(p["allele"].vcf_id)
+        consequence = (
+            (ann.get("primary_transcript") or {}).get("consequence_terms", [ann["most_severe_consequence"]])
+            if ann else ["unannotated"]
+        )
+        cases.append({
+            "id": f"reasoning-{p['gene']}-{p['variation_id']}",
+            "track": "reasoning",
+            "tags": [tier, p["gene"], consequence[0]],
+            "input": {"variant": p["hgvs"], "gene": p["gene"], "condition": p["condition"]},
+            "expected": {"classification": tier},
+            "meta": {
+                "clinvar_accession": p["rec"]["accession"], "review_status": p["rec"]["review_status"],
+                "date_last_evaluated": p["rec"]["date_last_evaluated"], "vcf_id": p["allele"].vcf_id,
+            },
+        })
+    return cases
+
+
+async def build_holdout() -> list[dict]:
+    """A second, disjoint reasoning set (different seed) for measuring changes
+    that were developed while looking at the main set's failures."""
+    main = {json.loads(l)["id"].rsplit("-", 1)[1] for l in (DATA / "reasoning.jsonl").read_text().splitlines()}
+    cases = await build_reasoning(random.Random(SEED + 1), seed=SEED + 1, exclude=frozenset(main))
+    for c in cases:
+        c["id"] = c["id"].replace("reasoning-", "holdout-", 1)
     return cases
 
 
@@ -156,10 +179,11 @@ def q(id_, question, answer_type, gold, **grading):
 
 async def build_tool_use() -> list[dict]:
     cases: list[dict] = []
-    for i, (variant, _why) in enumerate(TOOL_USE_VARIANTS):
-        [allele] = await resolve(variant)
+    resolved = [(await resolve(v))[0] for v, _ in TOOL_USE_VARIANTS]
+    anns = await vep_many(resolved)
+    for i, ((variant, _why), allele) in enumerate(zip(TOOL_USE_VARIANTS, resolved)):
         freq = await gnomad.variant_frequency(allele)
-        ann = await vep(allele)
+        ann = anns.get(allele.vcf_id)
         if ann is None:
             log(f"tool_use: skipping annotation questions for {variant} (Ensembl down)")
         pt = (ann or {}).get("primary_transcript") or {}
@@ -269,7 +293,7 @@ def write_markdown(tracks: dict[str, list[dict]]) -> None:
     lines = [f"# Eval cases (built {date.today().isoformat()}, seed {SEED})", ""]
     for track, cases in tracks.items():
         lines += [f"## {track} ({len(cases)} cases)", ""]
-        if track == "reasoning":
+        if track.startswith("reasoning"):
             lines += ["| id | gold | gene | variant | condition | consequence | ClinVar | evaluated |", "|---|---|---|---|---|---|---|---|"]
             for c in cases:
                 lines.append(f"| {c['id']} | {c['expected']['classification']} | {c['input']['gene']} | `{c['input']['variant']}` | "
@@ -290,14 +314,15 @@ def write_markdown(tracks: dict[str, list[dict]]) -> None:
 
 async def main(only: set[str]) -> None:
     rng = random.Random(SEED)
-    builders = {"reasoning": build_reasoning, "tool_use": build_tool_use, "retrieval": build_retrieval}
+    builders = {"reasoning": build_reasoning, "tool_use": build_tool_use, "retrieval": build_retrieval,
+                "reasoning_holdout": build_holdout}
     tracks: dict[str, list[dict]] = {}
     for name, build in builders.items():
         path = DATA / f"{name}.jsonl"
         if only and name not in only and path.exists():
             tracks[name] = [json.loads(line) for line in path.read_text().splitlines()]
             continue
-        tracks[name] = await (build(rng) if name != "tool_use" else build())
+        tracks[name] = await (build() if name in {"tool_use", "reasoning_holdout"} else build(rng))
         path.write_text("".join(json.dumps(c) + "\n" for c in tracks[name]))
         log(f"wrote {path} ({len(tracks[name])} cases)")
     write_markdown(tracks)

@@ -98,9 +98,7 @@ class Http:
         attempts: int = 4,
     ) -> str:
         """Return the response body as text, served from cache when fresh."""
-        key = hashlib.sha256(
-            json.dumps([method, url, params, json_body], sort_keys=True, default=str).encode()
-        ).hexdigest()
+        key = self.cache_key(method, url, params, json_body)
         if (hit := self._cache.get(key)) is not None:
             return hit
 
@@ -129,6 +127,16 @@ class Http:
             log(f"{host} attempt {attempt + 1}/{attempts} failed ({last_err[:120]}); retrying in {delay:.1f}s")
             await asyncio.sleep(delay)
         raise UpstreamError(f"{host} unavailable after {attempts} attempts ({last_err[:200]})")
+
+    @staticmethod
+    def cache_key(method: str, url: str, params: dict[str, Any] | None = None, json_body: Any = None) -> str:
+        return hashlib.sha256(
+            json.dumps([method, url, params, json_body], sort_keys=True, default=str).encode()
+        ).hexdigest()
+
+    def seed(self, method: str, url: str, body: str, *, params: dict[str, Any] | None = None, json_body: Any = None) -> None:
+        """Store a response as if this exact request had been made (used to split batch results)."""
+        self._cache.put(self.cache_key(method, url, params, json_body), body)
 
     async def get_json(self, url: str, **kw: Any) -> Any:
         return json.loads(await self.request("GET", url, **kw))
