@@ -8,6 +8,8 @@ Accepted inputs:
 
 HGVS and rsIDs are resolved with NCBI Variation Services, which return SPDI
 and convert it to left-aligned VCF fields (the representation gnomAD uses).
+Intronic HGVS, which NCBI rejects, is first projected to genomic HGVS by
+Ensembl VEP and then normalized by NCBI the same way.
 VCF-style input is checked against the GRCh38 reference via the UCSC API.
 """
 
@@ -15,10 +17,15 @@ import re
 from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
+from . import features
 from .http import UpstreamError, http
 
 NCBI_VARIATION = "https://api.ncbi.nlm.nih.gov/variation/v0"
 UCSC_SEQUENCE = "https://api.genome.ucsc.edu/getData/sequence"
+ENSEMBL_VEP_HGVS = "https://rest.ensembl.org/vep/human/hgvs"
+# c.123+5, c.124-2, c.-29+1, c.*10-3: a position with an intronic offset
+_INTRONIC_RE = re.compile(r":[cn]\.[-*]?\d+[+-]\d+")
+_COMPLEMENT = str.maketrans("ACGTN", "TGCAN")
 
 # GRCh38 RefSeq accessions for the primary assembly.
 GRCH38_ACCESSIONS = {
@@ -104,10 +111,37 @@ async def _spdi_to_allele(spdi: str) -> Allele:
     return Allele(chrom, int(data["pos"]), data["ref"], data["alt"])
 
 
+async def _genomic_hgvs_via_ensembl(hgvs: str) -> str:
+    """Project transcript HGVS (including intronic offsets) to GRCh38 genomic
+    HGVS with Ensembl VEP, so NCBI can normalize it. NCBI's Variation Services
+    reject intronic c. positions ("Intronic variants are not yet supported")."""
+    try:
+        [res] = await http().get_json(f"{ENSEMBL_VEP_HGVS}/{quote(hgvs, safe='')}", headers={"Accept": "application/json"})
+    except UpstreamError as e:
+        raise VariantInputError(f"Neither NCBI nor Ensembl could resolve HGVS {hgvs!r}: {e}") from e
+    acc = GRCH38_ACCESSIONS.get(str(res["seq_region_name"]).upper())
+    if acc is None:
+        raise VariantInputError(f"{hgvs!r} maps to {res['seq_region_name']}, not a GRCh38 primary chromosome")
+    ref, alt = res["allele_string"].split("/")[:2]
+    if int(res.get("strand", 1)) == -1:  # alleles are given on the transcript's strand
+        ref, alt = (s if s == "-" else s[::-1].translate(_COMPLEMENT) for s in (ref, alt))
+    start, end = int(res["start"]), int(res["end"])
+    if ref == "-":  # insertion: VEP reports start = end + 1
+        return f"{acc}:g.{end}_{start}ins{alt}"
+    span = f"{start}" if start == end else f"{start}_{end}"
+    if alt == "-":
+        return f"{acc}:g.{span}del"
+    if len(ref) == len(alt) == 1:
+        return f"{acc}:g.{start}{ref}>{alt}"
+    return f"{acc}:g.{span}delins{alt}"
+
+
 async def _from_hgvs(hgvs: str) -> list[Allele]:
     try:
         ctx = await http().get_json(f"{NCBI_VARIATION}/hgvs/{quote(hgvs, safe='')}/contextuals")
     except UpstreamError as e:
+        if features.on("intronic") and _INTRONIC_RE.search(hgvs):
+            return await _from_hgvs(await _genomic_hgvs_via_ensembl(hgvs))
         raise VariantInputError(f"NCBI could not parse HGVS {hgvs!r}: {e}") from e
     spdis = ctx.get("data", {}).get("spdis") or []
     if not spdis:

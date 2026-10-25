@@ -63,7 +63,7 @@ def test_clinvar_matches_only_the_records_own_allele():
 
 def test_grade_reasoning():
     g = grade_reasoning({"classification": "Pathogenic"}, {"classification": "Likely pathogenic"})
-    assert g == {"three_tier": 1.0, "exact": 0.0, "severe_error": 0.0, "within_one": 1.0}
+    assert g == {"three_tier": 1.0, "exact": 0.0, "severe_error": 0.0, "within_one": 1.0, "self_consistent": 0.0}
     g = grade_reasoning({"classification": "Benign"}, {"classification": "Likely pathogenic"})
     assert g["severe_error"] == 1.0 and g["three_tier"] == 0.0
     assert grade_reasoning({"classification": "Benign"}, {})["three_tier"] == 0.0
@@ -111,3 +111,74 @@ def test_hide_clinvar_removes_the_tool():
         return json.loads(out.stdout.strip().splitlines()[-1])
     assert "get_clinvar_classification" in tools("")
     assert "get_clinvar_classification" not in tools("1")
+
+
+def test_vep_primary_prefers_the_gene_the_variant_hits():
+    from genomics_mcp.ensembl import _primary
+    tcs = [  # VEP order for 3-12585745-G-A: neighbour's MANE transcript first
+        {"gene_symbol": "MKRN2", "transcript_id": "A", "consequence_terms": ["downstream_gene_variant"], "mane_select": "NM_1", "canonical": 1},
+        {"gene_symbol": "RAF1", "transcript_id": "B", "consequence_terms": ["missense_variant"], "mane_select": "NM_2", "canonical": 1},
+    ]
+    assert _primary(tcs, "missense_variant")["transcript_id"] == "B"
+    assert _primary(tcs, "missense_variant", gene="mkrn2")["transcript_id"] == "A"
+
+
+def test_tier_from_criteria():
+    from grade import tier_from_criteria
+    c = lambda code, s: {"code": code, "strength": s, "evidence": ""}
+    assert tier_from_criteria([c("PVS1", "very strong"), c("PM2", "supporting"), c("PP3", "supporting")]) == "Pathogenic"
+    assert tier_from_criteria([c("PVS1", "very strong"), c("PM2", "supporting")]) == "Likely pathogenic"
+    assert tier_from_criteria([c("PM2", "supporting"), c("PP3", "supporting")]) == "Uncertain significance"
+    assert tier_from_criteria([c("BP4", "supporting"), c("BP7", "supporting")]) == "Likely benign"
+    assert tier_from_criteria([c("BS1", "strong"), c("BP4", "moderate"), c("BP7", "supporting")]) == "Benign"
+    assert tier_from_criteria([c("BA1", "stand-alone"), c("PP3", "supporting")]) == "Benign"
+    assert tier_from_criteria([]) == "Uncertain significance"
+    assert tier_from_criteria([c("XYZ", "supporting")]) is None
+
+
+def test_codon_range_both_strands():
+    from genomics_mcp.clinvar import codon_range
+    # + strand, base is 2nd of its codon (cds 905 -> phase 1)
+    assert codon_range(1000, 905, 1) == (999, 1001)
+    # - strand: the codon's first base is at the highest coordinate
+    assert codon_range(1000, 904, -1) == (998, 1000)
+    assert codon_range(1000, 906, -1) == (1000, 1002)
+
+
+def test_protein_change_parsing():
+    from genomics_mcp.clinvar import _protein_change
+    assert _protein_change("NM_000527.5(LDLR):c.905G>T (p.Cys302Phe)") == ("Cys", 302, "Phe")
+    assert _protein_change("NM_000527.5(LDLR):c.906C>A (p.Cys302Ter)") == ("Cys", 302, "Ter")
+    assert _protein_change("NM_000527.5(LDLR):c.905del (p.Cys302fs)") == ("Cys", 302, "fs")
+    assert _protein_change("NM_177438.3(DICER1):c.5127T>C (p.Asp1709=)") == ("Asp", 1709, "=")
+    assert _protein_change("NM_000059.4(BRCA2):c.9256+735A>C") is None
+
+
+def test_intronic_hgvs_detection():
+    from genomics_mcp.variants import _INTRONIC_RE
+    for h in ["NM_000051.4:c.2639-17G>T", "NM_007294.4:c.4096+1G>A", "NM_000546.6:c.-29+1G>T", "NM_1.1:c.*10-3del"]:
+        assert _INTRONIC_RE.search(h), h
+    for h in ["NM_007294.4:c.5266dup", "NM_000546.6:c.743G>A", "NM_000546.6:c.-29G>A"]:
+        assert not _INTRONIC_RE.search(h), h
+
+
+def test_pvs1_context_nmd():
+    from genomics_mcp.ensembl import _pvs1_context
+    last = {"consequence_terms": ["frameshift_variant"], "exon": "66/66", "lof": "HC",
+            "lof_info": "PERCENTILE:0.977,DIST_FROM_LAST_EXON:-189,50_BP_RULE:FAIL"}
+    early = {"consequence_terms": ["stop_gained"], "exon": "2/10", "lof": "HC",
+             "lof_info": "PERCENTILE:0.27,DIST_FROM_LAST_EXON:1235,50_BP_RULE:PASS"}
+    assert _pvs1_context(last)["nmd_predicted"] is False and _pvs1_context(last)["in_last_exon"]
+    assert _pvs1_context(early)["nmd_predicted"] is True
+    assert _pvs1_context({"consequence_terms": ["missense_variant"]}) is None
+
+
+def test_features_env(monkeypatch):
+    import importlib
+    from genomics_mcp import features
+    monkeypatch.setenv("GENOMICS_MCP_FEATURES", "none")
+    assert importlib.reload(features).ENABLED == frozenset()
+    monkeypatch.setenv("GENOMICS_MCP_FEATURES", "codon,bogus")
+    assert importlib.reload(features).ENABLED == {"codon"}
+    monkeypatch.delenv("GENOMICS_MCP_FEATURES")
+    assert importlib.reload(features).ENABLED == features.ALL

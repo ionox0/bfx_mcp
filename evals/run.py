@@ -114,11 +114,27 @@ SYSTEM = {
         "Look up what ClinVar currently reports for the variant using the genomics tools provided, and report it "
         "faithfully. Call submit_answer once."
     ),
+    # Deliberately thin, like a host app: the MCP prompt carries the task instructions.
+    "interpret": (
+        "You are an assistant connected to the genomics MCP server. Follow the user's request. When you have "
+        "finished, call submit_answer once with your final classification and the criteria you applied."
+    ),
 }
+SUBMIT_TOOLS["interpret"] = SUBMIT_TOOLS["reasoning"]
+
+# What hosts like Claude Code give the model so it can read MCP resources itself.
+READ_RESOURCE_TOOL = {
+    "name": "read_mcp_resource",
+    "description": "Read an MCP resource from the genomics server by URI, e.g. genomics://acmg-criteria.",
+    "input_schema": {"type": "object", "properties": {"uri": {"type": "string"}}, "required": ["uri"]},
+}
+DATASET = {"interpret": "reasoning"}
 
 
 def user_prompt(track: str, case: dict) -> str:
     inp = case["input"]
+    if track == "interpret":
+        return case["_prompt"]  # fetched from the server's interpret_variant prompt
     if track == "reasoning":
         return f"Classify {inp['variant']} ({inp['gene']}) for {inp['condition']}."
     if track == "tool_use":
@@ -128,6 +144,8 @@ def user_prompt(track: str, case: dict) -> str:
 
 def anthropic_tools(mcp_tools, track: str) -> list[dict]:
     tools = [{"name": t.name, "description": t.description or "", "input_schema": t.input_schema} for t in mcp_tools]
+    if track == "interpret":
+        tools.append(READ_RESOURCE_TOOL)
     tools.append({**SUBMIT_TOOLS[track], "strict": True})
     return tools
 
@@ -223,10 +241,17 @@ class Runner:
                         results.append({"type": "tool_result", "tool_use_id": block.id, "content": "Recorded."})
                         continue
                     state["tool_calls"] += 1
-                    res = await mcp.call_tool(block.name, block.input)
-                    text = _result_text(res)
+                    if block.name == READ_RESOURCE_TOOL["name"]:
+                        try:
+                            res = await mcp.read_resource(block.input.get("uri", ""))
+                            text, is_error = "\n".join(getattr(c, "text", "") for c in res.contents), False
+                        except Exception as e:  # noqa: BLE001 - unknown URI etc. goes back to the model
+                            text, is_error = f"Error reading resource: {e}", True
+                    else:
+                        res = await mcp.call_tool(block.name, block.input)
+                        text, is_error = _result_text(res), bool(res.is_error)
                     trace.append({"role": "tool_result", "content": text})
-                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": text, "is_error": bool(res.is_error)})
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": text, "is_error": is_error})
             if submitted is not None:
                 return submitted
             if resp.stop_reason == "max_tokens":
@@ -277,7 +302,8 @@ def summarize(out: Path, track: str) -> None:
 
 
 async def main(args: argparse.Namespace) -> None:
-    cases = [json.loads(line) for line in (DATA / f"{args.track}.jsonl").read_text().splitlines()]
+    dataset = args.dataset or DATASET.get(args.track, args.track)
+    cases = [json.loads(line) for line in (DATA / f"{dataset}.jsonl").read_text().splitlines()]
     if args.ids:
         cases = [c for c in cases if c["id"] in set(args.ids.split(","))]
     if args.limit:
@@ -290,18 +316,28 @@ async def main(args: argparse.Namespace) -> None:
 
     runner = Runner(args)
     write_state(args.track)
+    (runner.out / "config.json").write_text(json.dumps({**vars(args), "dataset": dataset, "n_cases": len(cases)}, indent=2))
     done = runner.done_keys()
     todo = [(c, r) for c in cases for r in range(args.reps) if (c["id"], r) not in done]
     print(f"{args.track}/{args.variant}: {len(todo)} attempts to run ({len(done)} already done)")
 
     env = {**os.environ, "GENOMICS_MCP_CACHE": str(DATA / "cache.sqlite"), "GENOMICS_MCP_CACHE_TTL_S": "inf"}
-    if args.track == "reasoning":
+    if args.features != "all":
+        env["GENOMICS_MCP_FEATURES"] = args.features
+    hide_clinvar = args.track == "reasoning" or (args.track == "interpret" and not args.clinvar)
+    if hide_clinvar:
         env["GENOMICS_MCP_HIDE_CLINVAR"] = "1"
     server = StdioServerParameters(command=sys.executable, args=["-m", "genomics_mcp.server"], env=env, cwd=str(ROOT))
     async with Client(server, read_timeout_seconds=300) as mcp:
         listed = (await mcp.list_tools()).tools
-        if args.track == "reasoning":
+        if hide_clinvar:
             assert all(t.name != "get_clinvar_classification" for t in listed), "ClinVar must be hidden"
+        if args.track == "interpret":
+            for c, _ in todo:
+                inp = c["input"]
+                got = await mcp.get_prompt("interpret_variant", {
+                    "variant": f"{inp['variant']} ({inp['gene']})", "condition": inp["condition"]})
+                c["_prompt"] = "\n\n".join(m.content.text for m in got.messages)
         tools = anthropic_tools(listed, args.track)
         system = SYSTEM[args.track] + "\n\n" + (mcp.instructions or "")
         if args.track == "reasoning":
@@ -322,4 +358,7 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--ids", default="")
     p.add_argument("--concurrency", type=int, default=4)
+    p.add_argument("--clinvar", action="store_true", help="interpret track: leave ClinVar visible")
+    p.add_argument("--features", default="all", help='server features: "all", "none", or e.g. "codon,pvs1"')
+    p.add_argument("--dataset", default="", help="cases file stem in evals/data (default: the track's own)")
     asyncio.run(main(p.parse_args()))
