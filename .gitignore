@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Eval artifacts
+evals/data/cache.sqlite
+.claude/hillclimb/*/*/traces/
+.pytest_cache/
