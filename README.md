@@ -85,6 +85,76 @@ Known limits of the reasoning track:
 - Gene-specific VCEP rules (for example BRCA1/2 ENIGMA frequency thresholds)
   are not given to the agent unless you add them.
 
+## Results: `interpret_variant` eval
+
+The `interpret` track tests the server's `interpret_variant` MCP prompt end to
+end. Each case's user message is the prompt text a user would get from
+`/mcp__genomics__interpret_variant`, the agent reads `genomics://acmg-criteria`
+itself through a resource tool, and ClinVar's per-variant tool is hidden. It
+uses the reasoning cases: 60 variants with ClinVar expert-panel or
+practice-guideline classifications, 12 per tier across 22 genes. A disjoint
+60-case held-out set (`reasoning_holdout`, different seed) checks changes
+developed against the main set's failures. Agent: `claude-opus-5-5` at high
+effort, one run per case.
+
+Only the classification label is graded against gold. The criteria evidence
+text, summary and "not evaluable" notes are not scored, so a correct tier
+could rest on wrong reasoning. `self-consistent` checks only that the tier
+follows from the stated criteria codes and strengths under the ACMG point
+system.
+
+| | Original server, main set | Improved server, main set | Original server, held-out |
+|---|---|---|---|
+| **P/LP sensitivity** (P/LP gold called P/LP) | 14/24 (58%) | **17/24 (71%)** | 14/24 (58%) |
+| **P↔B flips** | 0/60 | 0/60 | 0/57 |
+| B/LB correct | 21/24 | 20/24 | 19/21 |
+| VUS correct | 11/12 | 11/12 | 9/12 |
+| 3-tier match | 46/60 | 48/60 | 42/57 |
+| 5-tier exact | 30/60 | 31/60 | 28/57 |
+| Self-consistent | 60/60 | 59/60 | 54/57 |
+| Median latency / tool calls | 32 s / 5.7 | 26 s / 5.6 | 29 s / 5.3 |
+| Cost | $6.76 | $6.66 | $6.32 |
+
+"Improved server" adds three changes, each switchable with
+`GENOMICS_MCP_FEATURES` (see `src/genomics_mcp/features.py`):
+`get_clinvar_codon_variants` (other ClinVar alleles at the same codon, for
+PS1/PM5, excluding the variant's own record), a `pvs1_context` block in
+`annotate_variant` (NMD prediction, last exon, LOFTEE detail), and intronic
+HGVS normalization through Ensembl when NCBI declines.
+
+What the results show:
+
+- **The main failure is missed pathogenic variants, not flips.** With the
+  original server the agent called 10 of 24 P/LP variants VUS and never
+  called a variant Pathogenic. It never placed a pathogenic variant in a benign
+  tier or the reverse. Most misses were missense variants where the expert
+  panel likely relied on functional, segregation or case data. In its notes
+  the agent most often asked for same-codon ClinVar evidence (PS1/PM5) and
+  gene-specific hotspot lists (PM1).
+- **The codon tool fixed 3 misses on the main set.** CDKL5, DICER1 and LDLR
+  missense variants moved from VUS to Likely pathogenic after the agent found
+  other pathogenic missense changes at the same residue and applied PM5. One
+  benign TP53 variant regressed from Likely benign to VUS; it is the only answer
+  whose tier contradicts its own criteria.
+- **Intronic normalization removed workarounds.** With the original server,
+  11 of 60 cases (mostly splice variants) failed normalization and the agent
+  guessed genomic coordinates, taking up to 14 tool calls and 251 s. With the
+  fix there were no tool errors and median latency fell from 32 s to 26 s.
+- **PVS1 context changed no outcome.** For the FBN1 frameshift it confirmed
+  the agent's moderate PVS1: the stop is in the last exon and escapes NMD.
+- **The gain is within noise.** +3 of 24 P/LP cases sits inside the 95%
+  intervals, and the main set is the one the changes were developed against.
+  The held-out run of the improved server is pending: the original-server
+  held-out run stopped at 57/60 cases and the improved-server run did not
+  start, because the API account ran out of credit.
+
+The full report, with method, confusion matrices, breakdowns by consequence
+and gene, tool usage and every case's criteria and tool calls, is
+`evals/results/interpret.html`. Regenerate it with
+`uv run python evals/report.py --out evals/results/interpret.html`. Its
+transcript links point into `.claude/hillclimb/`, which is gitignored, so they
+only work locally.
+
 ## Tests
 
 ```bash
